@@ -8,7 +8,7 @@ import { BundleFiles, FileInfo, SupportedFiles } from './interfaces/files.interf
 import {
   composeFilePayloads,
   resolveBundleFiles,
-  collectIgnoreRules,
+  collectFilePolicies,
   determineBaseDir,
   collectBundleFiles,
 } from './files';
@@ -26,7 +26,7 @@ import {
   getFilters,
 } from './http';
 
-import { MAX_PAYLOAD, MAX_UPLOAD_ATTEMPTS, UPLOAD_CONCURRENCY } from './constants';
+import { MAX_RETRY_ATTEMPTS, MAX_UPLOAD_ATTEMPTS, UPLOAD_CONCURRENCY } from './constants';
 import { emitter } from './emitter';
 import { AnalyzeFoldersOptions } from './interfaces/analysis-options.interface';
 
@@ -45,9 +45,18 @@ async function* prepareRemoteBundle(
   let { bundleHash } = options;
   let cumulativeProgress = 0;
   emitter.createBundleProgress(cumulativeProgress, options.files.length);
-  for (const chunkedFiles of composeFilePayloads(options.files, MAX_PAYLOAD)) {
+  for (const chunkedFiles of composeFilePayloads(options.files)) {
     const apiParams = {
-      ...pick(options, ['baseURL', 'sessionToken', 'source', 'removedFiles', 'requestId', 'base64Encoding', 'org']),
+      ...pick(options, [
+        'baseURL',
+        'sessionToken',
+        'source',
+        'extraHeaders',
+        'removedFiles',
+        'requestId',
+        'org',
+        'orgId',
+      ]),
       files: chunkedFiles.reduce((d, f) => {
         // deepcode ignore PrototypePollution: FP this is an internal code
         d[f.bundlePath] = f.hash;
@@ -97,8 +106,9 @@ export async function uploadRemoteBundle(options: UpdateRemoteBundleOptions): Pr
     'source',
     'bundleHash',
     'requestId',
-    'base64Encoding',
     'org',
+    'orgId',
+    'extraHeaders',
   ]);
 
   const uploadFileChunks = async (bucketFiles: FileInfo[]): Promise<void> => {
@@ -118,7 +128,7 @@ export async function uploadRemoteBundle(options: UpdateRemoteBundleOptions): Pr
   };
 
   const files: FileInfo[][] = [];
-  for (const bucketFiles of composeFilePayloads(options.files, MAX_PAYLOAD)) {
+  for (const bucketFiles of composeFilePayloads(options.files)) {
     files.push(bucketFiles);
   }
   await pMap(files, async (task: FileInfo[]) => await uploadFileChunks(task), {
@@ -137,7 +147,15 @@ async function fullfillRemoteBundle(options: FullfillRemoteBundleOptions): Promi
   // Check remove bundle to make sure no missing files left
   let attempts = 0;
   let { remoteBundle } = options;
-  const connectionOptions = pick(options, ['baseURL', 'sessionToken', 'source', 'requestId', 'base64Encoding', 'org']);
+  const connectionOptions = pick(options, [
+    'baseURL',
+    'sessionToken',
+    'source',
+    'requestId',
+    'org',
+    'orgId',
+    'extraHeaders',
+  ]);
 
   while (remoteBundle.missingFiles.length && attempts < (options.maxAttempts || MAX_UPLOAD_ATTEMPTS)) {
     const missingFiles = await resolveBundleFiles(options.baseDir, remoteBundle.missingFiles);
@@ -170,8 +188,9 @@ export async function remoteBundleFactory(options: RemoteBundleFactoryOptions): 
     'source',
     'baseDir',
     'requestId',
-    'base64Encoding',
     'org',
+    'orgId',
+    'extraHeaders',
   ]);
   const bundleFactory = prepareRemoteBundle(omit(options, ['baseDir']));
   for await (const response of bundleFactory) {
@@ -188,10 +207,6 @@ export async function remoteBundleFactory(options: RemoteBundleFactoryOptions): 
   return remoteBundle;
 }
 
-interface CreateBundleFromFoldersOptions extends ConnectionOptions, AnalyzeFoldersOptions {
-  // pass
-}
-
 /**
  * Get supported filters and test baseURL for correctness and availability
  *
@@ -199,26 +214,39 @@ interface CreateBundleFromFoldersOptions extends ConnectionOptions, AnalyzeFolde
  * @param source
  * @returns
  */
-async function getSupportedFiles(
+export async function getSupportedFiles(
   baseURL: string,
   source: string,
   requestId?: string,
   languages?: string[],
+  orgId?: string,
+  extraHeaders?: Record<string, string>,
 ): Promise<SupportedFiles> {
   emitter.supportedFilesLoaded(null);
-  const resp = await getFilters(baseURL, source, undefined, requestId);
+  const resp = await getFilters({
+    baseURL,
+    source,
+    orgId,
+    requestId,
+    attempts: MAX_RETRY_ATTEMPTS,
+    extraHeaders: extraHeaders ?? {},
+  });
   if (resp.type === 'error') {
     throw resp.error;
   }
   const supportedFilesFromApi = resp.value;
   //Given supported languages from 'registy'
   if (languages) {
-    const supportedFiles: SupportedFiles = {} as any;
-    supportedFiles.configFiles = supportedFilesFromApi.configFiles;
-    supportedFiles.extensions = languages;
+    const supportedFiles: SupportedFiles = {
+      configFiles: supportedFilesFromApi.configFiles,
+      extensions: languages,
+    };
+
     //For verification only
+    // Make sure we compare file extensions between results from `registry` and `deeproxy` without case sensitivity to avoid missing some of supported extensions.
+    const userSupportedExtensions = supportedFilesFromApi.extensions.map(e => e.toLowerCase());
     supportedFiles.extensions = supportedFiles.extensions.filter(langExtension =>
-      supportedFilesFromApi.extensions.includes(langExtension),
+      userSupportedExtensions.includes(langExtension.toLowerCase()),
     );
     emitter.supportedFilesLoaded(supportedFiles);
     return supportedFiles;
@@ -234,6 +262,10 @@ export interface FileBundle extends RemoteBundle {
   skippedOversizedFiles?: string[];
 }
 
+export interface CreateBundleFromFoldersOptions extends ConnectionOptions, AnalyzeFoldersOptions {
+  // pass
+}
+
 /**
  * Creates a remote bundle and returns response from the bundle API
  *
@@ -241,14 +273,36 @@ export interface FileBundle extends RemoteBundle {
  * @returns {Promise<FileBundle | null>}
  */
 export async function createBundleFromFolders(options: CreateBundleFromFoldersOptions): Promise<FileBundle | null> {
-  const baseDir = determineBaseDir(options.paths);
-  const [supportedFiles, fileIgnores] = await Promise.all([
-    // Fetch supporte files to save network traffic
-    getSupportedFiles(options.baseURL, options.source, options.requestId, options.languages),
-    // Scan for custom ignore rules
-    collectIgnoreRules(options.paths, options.symlinksEnabled, options.defaultFileIgnores),
-  ]);
+  // Fetch supported files to save network traffic
+  const supportedFiles = await getSupportedFiles(
+    options.baseURL,
+    options.source,
+    options.requestId,
+    options.languages,
+    options.orgId,
+    options.extraHeaders,
+  );
 
+  // Collect files and create a remote bundle
+  return await createBundleWithCustomFiles(options, supportedFiles);
+}
+
+/**
+ * Creates a remote bundle and returns response from the bundle API
+ * This function is used to create a bundle with a custom list of supported file extensions
+ *
+ * @param {CreateBundleFromFoldersOptions} options
+ * @param {SupportedFiles} supportedFiles
+ * @returns {Promise<FileBundle | null>}
+ */
+export async function createBundleWithCustomFiles(
+  options: CreateBundleFromFoldersOptions,
+  supportedFiles: SupportedFiles,
+): Promise<FileBundle | null> {
+  // Scan for custom ignore rules
+  const filePolicies = await collectFilePolicies(options.paths, options.symlinksEnabled, options.defaultFileIgnores);
+
+  const baseDir = determineBaseDir(options.paths);
   emitter.scanFilesProgress(0);
   const bundleFiles = [];
   const skippedOversizedFiles = [];
@@ -256,7 +310,7 @@ export async function createBundleFromFolders(options: CreateBundleFromFoldersOp
   const bundleFileCollector = collectBundleFiles({
     ...pick(options, ['paths', 'symlinksEnabled']),
     baseDir,
-    fileIgnores,
+    filePolicies,
     supportedFiles,
   });
   for await (const f of bundleFileCollector) {
@@ -266,10 +320,9 @@ export async function createBundleFromFolders(options: CreateBundleFromFoldersOp
   }
 
   const bundleOptions = {
-    ...pick(options, ['baseURL', 'sessionToken', 'source', 'requestId', 'base64Encoding']),
+    ...pick(options, ['baseURL', 'sessionToken', 'source', 'requestId', 'org', 'orgId', 'extraHeaders']),
     baseDir,
     files: bundleFiles,
-    ...(options.analysisContext?.org?.name ? { org: options.analysisContext.org.name } : {}),
   };
 
   // Create remote bundle
@@ -282,7 +335,7 @@ export async function createBundleFromFolders(options: CreateBundleFromFoldersOp
     ...remoteBundle,
     baseDir,
     supportedFiles,
-    fileIgnores,
+    fileIgnores: [...filePolicies.excludes, ...filePolicies.ignores],
     skippedOversizedFiles,
   };
 }

@@ -8,13 +8,14 @@ export const GIT_FILENAME = '.git';
 export const GITIGNORE_FILENAME = '.gitignore';
 export const DCIGNORE_FILENAME = '.dcignore';
 export const DOTSNYK_FILENAME = '.snyk';
-export const EXCLUDED_NAMES = [GIT_FILENAME, GITIGNORE_FILENAME, DCIGNORE_FILENAME];
+export const EXCLUDED_NAMES = [GITIGNORE_FILENAME, DCIGNORE_FILENAME];
 export const CACHE_KEY = '.dccache';
 export const MAX_UPLOAD_ATTEMPTS = 10;
 export const UPLOAD_CONCURRENCY = 2;
 export const POLLING_INTERVAL = 500;
 export const MAX_RETRY_ATTEMPTS = 10; // Request retries on network errors
 export const REQUEST_RETRY_DELAY = 5 * 1000; // delay between retries in milliseconds
+export const ORG_ID_REGEXP = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const IGNORES_DEFAULT = [`**/${GIT_FILENAME}/**`];
 

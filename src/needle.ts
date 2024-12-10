@@ -4,8 +4,9 @@ import needle from 'needle';
 import * as querystring from 'querystring';
 import https from 'https';
 import { URL } from 'url';
-import { emitter } from './emitter';
+import { JsonApiErrorObject } from './interfaces/json-api';
 
+import { emitter } from './emitter';
 import { ErrorCodes, NETWORK_ERRORS, MAX_RETRY_ATTEMPTS, REQUEST_RETRY_DELAY } from './constants';
 
 const sleep = (duration: number) => new Promise(resolve => setTimeout(resolve, duration));
@@ -45,10 +46,12 @@ interface SuccessResponse<T> {
   success: true;
   body: T;
 }
+
 export type FailedResponse = {
   success: false;
   errorCode: number;
   error: Error | undefined;
+  errors?: JsonApiErrorObject[] | undefined;
 };
 
 export async function makeRequest<T = void>(
@@ -77,6 +80,7 @@ export async function makeRequest<T = void>(
   }
 
   const options: needle.NeedleOptions = {
+    use_proxy_from_env_var: false,
     headers: payload.headers,
     open_timeout: TIMEOUT_DEFAULT, // No timeout
     response_timeout: payload.timeout || TIMEOUT_DEFAULT,
@@ -95,6 +99,7 @@ export async function makeRequest<T = void>(
     let errorCode: number | undefined;
     let error: Error | undefined;
     let response: needle.NeedleResponse | undefined;
+
     try {
       response = await needle(method, url, data, options);
       emitter.apiRequestLog(`<= Response: ${response.statusCode} ${JSON.stringify(response.body)}`);
@@ -107,6 +112,14 @@ export async function makeRequest<T = void>(
       emitter.apiRequestLog(`Requested url --> ${url} | error --> ${err}`);
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+    const errorMessage = response?.body?.error;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment,@typescript-eslint/no-unsafe-member-access
+    const errors = response?.body?.errors as JsonApiErrorObject[] | undefined;
+
+    if (errorMessage) {
+      error = error ?? new Error(errorMessage);
+    }
     errorCode = errorCode ?? ErrorCodes.serviceUnavailable;
 
     // Try to avoid breaking requests due to temporary network errors
@@ -125,7 +138,7 @@ export async function makeRequest<T = void>(
       await sleep(REQUEST_RETRY_DELAY);
     } else {
       attempts = 0;
-      return { success: false, errorCode, error };
+      return { success: false, errorCode, error, errors };
     }
   } while (attempts > 0);
 

@@ -3,11 +3,12 @@ import fs from 'fs';
 
 import { FileInfo } from '../../src/interfaces/files.interface';
 import { getFileInfo, notEmpty } from '../../src/files';
+import { ReportResult } from '../../src';
 
 export const sampleProjectPath = path.resolve(__dirname, '../sample-repo');
 export const supportedFiles = {
   extensions: ['.js', '.jsx', '.cpp', '.java'], // <= not aligned with currently returned extensions from backend
-  configFiles: ['.eslintrc.json', '.dcignore'], // <= we are not running linters in the backend anymore
+  configFiles: ['.eslintrc.json', '.dcignore', '.snyk'], // <= we are not running linters in the backend anymore
 };
 
 export const bundleFileIgnores = [
@@ -26,13 +27,37 @@ export const bundleFileIgnores = [
   `${sampleProjectPath}/exclude/excluded-folder/**`,
 ];
 
+export const bundleFilePolicies = {
+  excludes: [
+    `${sampleProjectPath}/**/exclude/excluded-file.js/**`,
+    `${sampleProjectPath}/**/exclude/excluded-file.js`,
+    `${sampleProjectPath}/exclude/excluded-folder/**`,
+  ],
+  ignores: [
+    '**/.git/**',
+    `${sampleProjectPath}/**/mode_nodules/**`,
+    `${sampleProjectPath}/models/**`,
+    `${sampleProjectPath}/**/controllers/**`,
+    `${sampleProjectPath}/**/ignored/**`,
+    `${sampleProjectPath}/**/ignored`,
+    `!${sampleProjectPath}/**/not/ignored/**`,
+    `!${sampleProjectPath}/**/not/ignored`,
+    `${sampleProjectPath}/**/*.jsx/**`,
+    `${sampleProjectPath}/**/*.jsx`,
+  ],
+};
+
+export const fileIgnoresFixtures = path.resolve(__dirname, '../fixtures/file-ignores');
+
 export const bundleFilePaths = [
   '/.eslintrc.json', // <= we are not running linters in the backend anymore
-  'AnnotatorTest.cpp',
+  '.snyk',
+  'AnnotatorTest.Cpp',
   'GitHubAccessTokenScrambler12.java',
   'app.js',
   'db.js',
   'main.js',
+  'exclude/.snyk',
   'big-file.js', // <= file size is over the custom MAX_FILE_SIZE
   'routes/index.js',
   'routes/sharks.js',
@@ -60,7 +85,7 @@ export const bundleExtender: () => Promise<{
   restore: () => void;
 }> = async () => {
   const fBundle = await bundleFilesFull;
-  const changedFilesNames = [`GitHubAccessTokenScrambler12.java`, `AnnotatorTest.cpp`];
+  const changedFilesNames = [`GitHubAccessTokenScrambler12.java`, `AnnotatorTest.Cpp`];
   const addedFilesNames = [`GHATS12.java`];
   const [changedFiles, addedFiles] = [changedFilesNames, addedFilesNames].map(arr =>
     arr.map(name => `${sampleProjectPath}/${name}`),
@@ -87,3 +112,18 @@ export const bundleExtender: () => Promise<{
     },
   };
 };
+
+export const initReportReturn = 'test-reportId';
+
+export const getReportReturn = {
+  status: 'COMPLETE',
+  uploadResult: {
+    projectId: 'test-projectId',
+    snapshotId: 'test-snapshotId',
+    reportUrl: 'test-reportUrl',
+  },
+  analysisResult: {
+    type: 'sarif',
+    sarif: {},
+  },
+} as ReportResult;

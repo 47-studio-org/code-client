@@ -39,22 +39,47 @@ export interface AnalysisContext {
   };
 }
 
-export interface FileAnalysisOptions extends AnalysisContext {
-  connection: ConnectionOptions;
-  analysisOptions: AnalysisOptions;
-  fileOptions: AnalyzeFoldersOptions;
-  languages?: string[];
-}
-
-export interface AnalyzeFoldersOptions extends AnalysisContext {
+export interface AnalyzeFoldersOptions {
   paths: string[];
   symlinksEnabled?: boolean;
   defaultFileIgnores?: string[];
   languages?: string[];
 }
 
+export interface FilePolicies {
+  excludes: string[];
+  ignores: string[];
+}
+
 export interface CollectBundleFilesOptions extends AnalyzeFoldersOptions {
   supportedFiles: SupportedFiles;
   baseDir: string;
-  fileIgnores: string[];
+  filePolicies: FilePolicies;
+}
+
+export interface ReportOptions {
+  enabled: boolean;
+  projectName?: string;
+  targetName?: string;
+  targetRef?: string;
+  remoteRepoUrl?: string;
+}
+
+export interface ScmReportOptions {
+  projectId?: string;
+  commitId?: string;
+}
+
+export interface FileAnalysisOptions extends AnalysisContext {
+  connection: ConnectionOptions;
+  analysisOptions: AnalysisOptions;
+  fileOptions: AnalyzeFoldersOptions;
+  reportOptions?: ReportOptions;
+  languages?: string[];
+}
+
+export interface ScmAnalysisOptions extends AnalysisContext {
+  connection: ConnectionOptions;
+  analysisOptions: AnalysisOptions;
+  reportOptions: ScmReportOptions;
 }

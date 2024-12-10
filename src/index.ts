@@ -1,5 +1,5 @@
-import { analyzeFolders, extendAnalysis } from './analysis';
-import { createBundleFromFolders } from './bundles';
+import { analyzeFolders, extendAnalysis, analyzeScmProject } from './analysis';
+import { getSupportedFiles, createBundleFromFolders, createBundleWithCustomFiles } from './bundles';
 import { emitter } from './emitter';
 import { startSession, checkSession, getAnalysis, getIpFamily, IpFamily } from './http';
 import { MAX_FILE_SIZE } from './constants';
@@ -10,23 +10,30 @@ import { SupportedFiles, FileAnalysis } from './interfaces/files.interface';
 import { AnalysisSeverity, AnalysisContext } from './interfaces/analysis-options.interface';
 import {
   AnalysisResult,
+  AnalysisResultSarif,
   AnalysisResultLegacy,
   FilePath,
   FileSuggestion,
   Suggestion,
   Marker,
+  ReportResult,
+  ScmAnalysis,
 } from './interfaces/analysis-result.interface';
 
 export {
   getGlobPatterns,
   analyzeFolders,
+  analyzeScmProject,
+  getSupportedFiles,
   createBundleFromFolders,
+  createBundleWithCustomFiles,
   extendAnalysis,
   emitter,
   MAX_FILE_SIZE,
   constants,
   AnalysisSeverity,
   AnalysisResult,
+  AnalysisResultSarif,
   AnalysisResultLegacy,
   SupportedFiles,
   FileAnalysis,
@@ -40,4 +47,6 @@ export {
   getIpFamily,
   IpFamily,
   AnalysisContext,
+  ReportResult,
+  ScmAnalysis,
 };

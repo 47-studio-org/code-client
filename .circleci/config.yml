@@ -1,41 +1,73 @@
 version: 2.1
+
+orbs:
+  prodsec: snyk/prodsec-orb@1
+
 jobs:
-  test:
+  security-scans:
     parameters:
       node_version:
         type: string
     working_directory: ~/code-sdk
     docker:
-      - image: circleci/node:<< parameters.node_version >>
+      - image: cimg/node:<< parameters.node_version >>
     steps:
       - checkout
       - restore_cache:
           keys:
             - v2-{{ .Branch }}-{{ .Revision }}-<< parameters.node_version >>
-            - v2-{{ .Branch }}-<< parameters.node_version >>
-            - v2-<< parameters.node_version >>
       - run:
           name: Install
           command: npm install
+      - prodsec/security_scans:
+          mode: auto
+          release-branch: master
+          iac-scan: disabled
+
+  test:
+    parameters:
+      node_version:
+        type: string
+      package-lock:
+        type: string
+    working_directory: ~/code-sdk
+    docker:
+      - image: cimg/node:<< parameters.node_version >>
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v2-{{ .Branch }}-{{ .Revision }}-<< parameters.node_version >>>-<< parameters.package-lock >>>
+      - when:
+          condition: << parameters.package-lock >> == "locked-dependencies"
+          steps:
+            - run:
+                name: Install
+                command: npm install
+      - unless:
+          condition: << parameters.package-lock >>
+          steps:
+            - run:
+                name: Install without locked dependencies
+                command: npm install --no-package-lock
       - save_cache:
-          key: v2-{{ .Branch }}-{{ .Revision }}
+          key: v2-{{ .Branch }}-{{ .Revision }}-<< parameters.node_version >>-<< parameters.package-lock >>>
           paths:
             - node_modules
       - run: npm run test
+
   lint:
     parameters:
       node_version:
         type: string
     working_directory: ~/code-sdk
     docker:
-      - image: circleci/node:<< parameters.node_version >>
+      - image: cimg/node:<< parameters.node_version >>
     steps:
       - checkout
       - restore_cache:
           keys:
             - v2-{{ .Branch }}-{{ .Revision }}-<< parameters.node_version >>
-            - v2-{{ .Branch }}-<< parameters.node_version >>
-            - v2-<< parameters.node_version >>
       - run:
           name: Install
           command: npm install
@@ -47,14 +79,12 @@ jobs:
         type: string
     working_directory: ~/code-sdk
     docker:
-      - image: circleci/node:<< parameters.node_version >>
+      - image: cimg/node:<< parameters.node_version >>
     steps:
       - checkout
       - restore_cache:
           keys:
             - v2-{{ .Branch }}-{{ .Revision }}-<< parameters.node_version >>
-            - v2-{{ .Branch }}-<< parameters.node_version >>
-            - v2-<< parameters.node_version >>
       - run:
           name: Install
           command: npm install
@@ -66,17 +96,31 @@ jobs:
 workflows:
   default_workflow:
     jobs:
+      - prodsec/secrets-scan:
+          context:
+            - snyk-bot-slack
+          channel: workspaces-alerts
+          filters:
+            branches:
+              ignore:
+                - master
+      - security-scans:
+          node_version: '12.22.7'
+          name: Security Scans
+          context:
+            - analysis_workspaces
       - lint:
-          node_version: '12'
+          node_version: '12.22.7'
       - test:
           matrix:
             parameters:
-              node_version: ['10', '12']
+              node_version: ['10.24.0', '12.22.7']
+              package-lock: ['locked-dependencies', 'no-package-lock']
           context: nodejs-install
           requires:
             - lint
       - release:
-          node_version: '12'
+          node_version: '12.22.7'
           context: nodejs-lib-release
           requires:
             - lint

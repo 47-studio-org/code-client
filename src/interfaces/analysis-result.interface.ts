@@ -86,4 +86,21 @@ export interface AnalysisResultLegacy extends AnalysisResultBase {
   files: AnalysisFiles;
 }
 
+export interface ReportUploadResult {
+  projectId: string;
+  snapshotId: string;
+  reportUrl: string;
+}
+
+export interface ReportResult {
+  status: 'COMPLETE';
+  uploadResult: ReportUploadResult;
+  analysisResult: AnalysisResultSarif;
+}
+
 export type AnalysisResult = AnalysisResultSarif | AnalysisResultLegacy;
+
+export interface ScmAnalysis {
+  analysisResults: AnalysisResultSarif;
+  reportResults?: ReportUploadResult;
+}

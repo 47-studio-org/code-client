@@ -3,21 +3,29 @@ import pick from 'lodash.pick';
 import { gzip } from 'zlib';
 import { promisify } from 'util';
 
-import { ErrorCodes, GenericErrorTypes, DEFAULT_ERROR_MESSAGES, MAX_RETRY_ATTEMPTS } from './constants';
+import { DEFAULT_ERROR_MESSAGES, ErrorCodes, GenericErrorTypes } from './constants';
 
 import { BundleFiles, SupportedFiles } from './interfaces/files.interface';
-import { AnalysisResult } from './interfaces/analysis-result.interface';
+import { AnalysisResult, ReportResult } from './interfaces/analysis-result.interface';
 import { FailedResponse, makeRequest, Payload } from './needle';
-import { AnalysisOptions, AnalysisContext } from './interfaces/analysis-options.interface';
-import { URL } from 'url';
+import {
+  AnalysisContext,
+  AnalysisOptions,
+  ReportOptions,
+  ScmReportOptions,
+} from './interfaces/analysis-options.interface';
+import { generateErrorWithDetail, getURL } from './utils/httpUtils';
+import { JsonApiErrorObject } from './interfaces/json-api';
 
 type ResultSuccess<T> = { type: 'success'; value: T };
-type ResultError<E> = {
+
+export type ResultError<E> = {
   type: 'error';
   error: {
     statusCode: E;
     statusText: string;
     apiName: string;
+    detail?: string | undefined;
   };
 };
 
@@ -28,25 +36,34 @@ export interface ConnectionOptions {
   sessionToken: string;
   source: string;
   requestId?: string;
-  base64Encoding: boolean;
   org?: string;
+  orgId?: string;
+  extraHeaders?: { [key: string]: string };
 }
 
 // The trick to typecast union type alias
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function isSubsetErrorCode<T>(code: any, messages: { [c: number]: string }): code is T {
-  if (code in messages) {
-    return true;
-  }
-  return false;
+  return code in messages;
 }
 
-function generateError<E>(errorCode: number, messages: { [c: number]: string }, apiName: string): ResultError<E> {
+function generateError<E>(
+  errorCode: number,
+  messages: { [c: number]: string },
+  apiName: string,
+  errorMessage?: string,
+  errors?: JsonApiErrorObject[],
+): ResultError<E> {
+  if (errors) {
+    return generateErrorWithDetail<E>(errors[0], errorCode, apiName);
+  }
+
   if (!isSubsetErrorCode<E>(errorCode, messages)) {
-    throw { errorCode, messages, apiName };
+    throw { statusCode: errorCode, statusText: errorMessage || 'unknown error occurred', apiName };
   }
 
   const statusCode = errorCode;
-  const statusText = messages[errorCode];
+  const statusText = errorMessage ?? messages[errorCode];
 
   return {
     type: 'error',
@@ -77,25 +94,10 @@ interface StartSessionOptions {
   readonly source: string;
 }
 
-export function setBase64Encoding(options: ConnectionOptions): boolean {
-  if (!options.base64Encoding) {
-    const { hostname } = new URL(options.baseURL);
-    const rg = new RegExp('^(|dev.)snyk.io');
-    if (rg.test(hostname.slice(hostname.indexOf('.') + 1))) {
-      return options.base64Encoding;
-    } else {
-      return true;
-    }
-  } else {
-    return options.base64Encoding;
-  }
-}
-
-export async function compressAndEncode(payload: any): Promise<Buffer> {
+export async function compressAndEncode(payload: unknown): Promise<Buffer> {
   // encode payload and compress;
   const deflate = promisify(gzip);
-  const compressedPayload = await deflate(Buffer.from(JSON.stringify(payload)).toString('base64'));
-  return compressedPayload;
+  return await deflate(Buffer.from(JSON.stringify(payload)).toString('base64'));
 }
 
 export function startSession(options: StartSessionOptions): StartSessionResponseDto {
@@ -106,6 +108,10 @@ export function startSession(options: StartSessionOptions): StartSessionResponse
     draftToken,
     loginURL: `${authHost}/login?token=${draftToken}&utm_medium=${source}&utm_source=${source}&utm_campaign=${source}&docker=false`,
   };
+}
+
+export function getVerifyCallbackUrl(authHost: string): string {
+  return `${authHost}/api/verify/callback`;
 }
 
 export type IpFamily = 6 | undefined;
@@ -174,18 +180,40 @@ export async function checkSession(options: CheckSessionOptions): Promise<Result
   return generateError<CheckSessionErrorCodes>(res.errorCode, CHECK_SESSION_ERROR_MESSAGES, 'checkSession');
 }
 
-export async function getFilters(
-  baseURL: string,
-  source: string,
-  attempts = MAX_RETRY_ATTEMPTS,
-  requestId?: string,
-): Promise<Result<SupportedFiles, GenericErrorTypes>> {
+export interface FilterArgs {
+  extraHeaders: Record<string, string>;
+  attempts: number;
+  baseURL: string;
+  source: string;
+  requestId?: string;
+  orgId?: string;
+}
+
+export async function getFilters({
+  baseURL,
+  orgId,
+  attempts,
+  source,
+  extraHeaders,
+  requestId,
+}: FilterArgs): Promise<Result<SupportedFiles, GenericErrorTypes>> {
   const apiName = 'filters';
+  let url: string;
+
+  try {
+    url = getURL(baseURL, '/' + apiName, orgId);
+  } catch (err) {
+    return generateError<GenericErrorTypes>(400, err.message, apiName);
+  }
 
   const res = await makeRequest<SupportedFiles>(
     {
-      headers: { source, ...(requestId && { 'snyk-request-id': requestId }) },
-      url: `${baseURL}/${apiName}`,
+      headers: {
+        source,
+        ...extraHeaders,
+        ...(requestId && { 'snyk-request-id': requestId }),
+      },
+      url,
       method: 'get',
     },
     attempts,
@@ -194,14 +222,16 @@ export async function getFilters(
   if (res.success) {
     return { type: 'success', value: res.body };
   }
-  return generateError<GenericErrorTypes>(res.errorCode, GENERIC_ERROR_MESSAGES, apiName);
+  return generateError<GenericErrorTypes>(res.errorCode, GENERIC_ERROR_MESSAGES, apiName, undefined, res.errors);
 }
 
-function prepareTokenHeaders(sessionToken: string) {
+function commonHttpHeaders(options: ConnectionOptions) {
   return {
-    'Session-Token': sessionToken,
-    // We need to be able to test code-client without deepcode locally
-    Authorization: `Bearer ${sessionToken}`,
+    Authorization: options.sessionToken,
+    source: options.source,
+    ...(options.requestId && { 'snyk-request-id': options.requestId }),
+    ...(options.org && { 'snyk-org-name': options.org }),
+    ...options.extraHeaders,
   };
 }
 
@@ -234,32 +264,38 @@ interface CreateBundleOptions extends ConnectionOptions {
 export async function createBundle(
   options: CreateBundleOptions,
 ): Promise<Result<RemoteBundle, CreateBundleErrorCodes>> {
-  const base64Encoding = setBase64Encoding(options);
-  let payloadBody: Payload['body'];
-  if (base64Encoding) {
-    payloadBody = await compressAndEncode(options.files);
-  } else {
-    payloadBody = options.files;
+  const payloadBody = await compressAndEncode(options.files);
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, '/bundle', options.orgId);
+  } catch (err) {
+    return generateError<CreateBundleErrorCodes>(400, err.message, 'createBundle');
   }
+
   const payload: Payload = {
     headers: {
-      ...prepareTokenHeaders(options.sessionToken),
-      source: options.source,
-      ...(options.requestId && { 'snyk-request-id': options.requestId }),
-      ...(base64Encoding ? { 'content-type': 'application/octet-stream', 'content-encoding': 'gzip' } : null),
-      ...(options.org && { 'snyk-org-name': options.org }),
+      'content-type': 'application/octet-stream',
+      'content-encoding': 'gzip',
+      ...commonHttpHeaders(options),
     },
-    url: `${options.baseURL}/bundle`,
+    url,
     method: 'post',
     body: payloadBody,
-    isJson: base64Encoding ? false : true,
+    isJson: false,
   };
 
   const res = await makeRequest<RemoteBundle>(payload);
   if (res.success) {
     return { type: 'success', value: res.body };
   }
-  return generateError<CreateBundleErrorCodes>(res.errorCode, CREATE_BUNDLE_ERROR_MESSAGES, 'createBundle');
+  return generateError<CreateBundleErrorCodes>(
+    res.errorCode,
+    CREATE_BUNDLE_ERROR_MESSAGES,
+    'createBundle',
+    undefined,
+    res.errors,
+  );
 }
 
 export type CheckBundleErrorCodes =
@@ -280,19 +316,30 @@ interface CheckBundleOptions extends ConnectionOptions {
 }
 
 export async function checkBundle(options: CheckBundleOptions): Promise<Result<RemoteBundle, CheckBundleErrorCodes>> {
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, `/bundle/${options.bundleHash}`, options.orgId);
+  } catch (err) {
+    return generateError<CheckBundleErrorCodes>(400, err.message, 'checkBundle');
+  }
+
   const res = await makeRequest<RemoteBundle>({
     headers: {
-      ...prepareTokenHeaders(options.sessionToken),
-      source: options.source,
-      ...(options.requestId && { 'snyk-request-id': options.requestId }),
-      ...(options.org && { 'snyk-org-name': options.org }),
+      ...commonHttpHeaders(options),
     },
-    url: `${options.baseURL}/bundle/${options.bundleHash}`,
+    url,
     method: 'get',
   });
 
   if (res.success) return { type: 'success', value: res.body };
-  return generateError<CheckBundleErrorCodes>(res.errorCode, CHECK_BUNDLE_ERROR_MESSAGES, 'checkBundle');
+  return generateError<CheckBundleErrorCodes>(
+    res.errorCode,
+    CHECK_BUNDLE_ERROR_MESSAGES,
+    'checkBundle',
+    undefined,
+    res.errors,
+  );
 }
 
 export type ExtendBundleErrorCodes =
@@ -321,28 +368,34 @@ interface ExtendBundleOptions extends ConnectionOptions {
 export async function extendBundle(
   options: ExtendBundleOptions,
 ): Promise<Result<RemoteBundle, ExtendBundleErrorCodes>> {
-  const base64Encoding = setBase64Encoding(options);
-  let payloadBody;
-  if (base64Encoding) {
-    payloadBody = await compressAndEncode(pick(options, ['files', 'removedFiles']));
-  } else {
-    payloadBody = pick(options, ['files', 'removedFiles']);
+  const payloadBody = await compressAndEncode(pick(options, ['files', 'removedFiles']));
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, `/bundle/${options.bundleHash}`, options.orgId);
+  } catch (err) {
+    return generateError<ExtendBundleErrorCodes>(400, err.message, 'extendBundle');
   }
+
   const res = await makeRequest<RemoteBundle>({
     headers: {
-      ...prepareTokenHeaders(options.sessionToken),
-      source: options.source,
-      ...(options.requestId && { 'snyk-request-id': options.requestId }),
-      ...(base64Encoding ? { 'content-type': 'application/octet-stream', 'content-encoding': 'gzip' } : null),
-      ...(options.org && { 'snyk-org-name': options.org }),
+      'content-type': 'application/octet-stream',
+      'content-encoding': 'gzip',
+      ...commonHttpHeaders(options),
     },
-    url: `${options.baseURL}/bundle/${options.bundleHash}`,
+    url,
     method: 'put',
     body: payloadBody,
-    isJson: base64Encoding ? false : true,
+    isJson: false,
   });
   if (res.success) return { type: 'success', value: res.body };
-  return generateError<ExtendBundleErrorCodes>(res.errorCode, EXTEND_BUNDLE_ERROR_MESSAGES, 'extendBundle');
+  return generateError<ExtendBundleErrorCodes>(
+    res.errorCode,
+    EXTEND_BUNDLE_ERROR_MESSAGES,
+    'extendBundle',
+    undefined,
+    res.errors,
+  );
 }
 
 // eslint-disable-next-line no-shadow
@@ -389,14 +442,18 @@ export interface GetAnalysisOptions extends ConnectionOptions, AnalysisOptions, 
 export async function getAnalysis(
   options: GetAnalysisOptions,
 ): Promise<Result<GetAnalysisResponseDto, GetAnalysisErrorCodes>> {
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, '/analysis', options.orgId);
+  } catch (err) {
+    return generateError<GetAnalysisErrorCodes>(400, err.message, 'getAnalysis');
+  }
   const config: Payload = {
     headers: {
-      ...prepareTokenHeaders(options.sessionToken),
-      source: options.source,
-      ...(options.requestId && { 'snyk-request-id': options.requestId }),
-      ...(options.org && { 'snyk-org-name': options.org }),
+      ...commonHttpHeaders(options),
     },
-    url: `${options.baseURL}/analysis`,
+    url,
     method: 'post',
     body: {
       key: {
@@ -410,10 +467,185 @@ export async function getAnalysis(
   };
 
   const res = await makeRequest<GetAnalysisResponseDto>(config);
-  if (res.success) return { type: 'success', value: res.body };
-  return generateError<GetAnalysisErrorCodes>(res.errorCode, GET_ANALYSIS_ERROR_MESSAGES, 'getAnalysis');
+  if (res.success) {
+    return { type: 'success', value: res.body };
+  }
+  return generateError<GetAnalysisErrorCodes>(
+    res.errorCode,
+    GET_ANALYSIS_ERROR_MESSAGES,
+    'getAnalysis',
+    undefined,
+    res.errors,
+  );
 }
 
-export function getVerifyCallbackUrl(authHost: string): string {
-  return `${authHost}/api/verify/callback`;
+export type ReportErrorCodes =
+  | GenericErrorTypes
+  | ErrorCodes.unauthorizedUser
+  | ErrorCodes.unauthorizedBundleAccess
+  | ErrorCodes.badRequest
+  | ErrorCodes.notFound;
+
+const REPORT_ERROR_MESSAGES: { [P in ReportErrorCodes]: string } = {
+  ...GENERIC_ERROR_MESSAGES,
+  [ErrorCodes.unauthorizedUser]: DEFAULT_ERROR_MESSAGES[ErrorCodes.unauthorizedUser],
+  [ErrorCodes.unauthorizedBundleAccess]: DEFAULT_ERROR_MESSAGES[ErrorCodes.unauthorizedBundleAccess],
+  [ErrorCodes.notFound]: DEFAULT_ERROR_MESSAGES[ErrorCodes.notFound],
+  [ErrorCodes.badRequest]: DEFAULT_ERROR_MESSAGES[ErrorCodes.badRequest],
+  [ErrorCodes.serverError]: 'Getting report failed',
+};
+
+export interface UploadReportOptions extends GetAnalysisOptions {
+  report: ReportOptions;
+}
+
+export interface ScmUploadReportOptions extends ConnectionOptions, AnalysisOptions, AnalysisContext, ScmReportOptions {}
+
+export interface GetReportOptions extends ConnectionOptions {
+  pollId: string;
+}
+
+export type InitUploadResponseDto = {
+  reportId: string;
+};
+
+export type InitScmUploadResponseDto = {
+  testId: string;
+};
+
+export type UploadReportResponseDto = ReportResult | AnalysisFailedResponse | AnalysisResponseProgress;
+
+/**
+ * Trigger a file-based test with reporting.
+ */
+export async function initReport(options: UploadReportOptions): Promise<Result<string, ReportErrorCodes>> {
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, `/report`, options.orgId);
+  } catch (err) {
+    return generateError<ReportErrorCodes>(400, err.message, 'initReport');
+  }
+
+  const config: Payload = {
+    headers: {
+      ...commonHttpHeaders(options),
+    },
+    url,
+    method: 'post',
+    body: {
+      workflowData: {
+        projectName: options.report.projectName,
+        targetName: options.report.targetName,
+        targetRef: options.report.targetRef,
+        remoteRepoUrl: options.report.remoteRepoUrl,
+      },
+      key: {
+        type: 'file',
+        hash: options.bundleHash,
+        limitToFiles: options.limitToFiles || [],
+        ...(options.shard ? { shard: options.shard } : null),
+      },
+      ...pick(options, ['severity', 'prioritized', 'legacy', 'analysisContext']),
+    },
+  };
+
+  const res = await makeRequest<InitUploadResponseDto>(config);
+  if (res.success) return { type: 'success', value: res.body.reportId };
+  return generateError<ReportErrorCodes>(res.errorCode, REPORT_ERROR_MESSAGES, 'initReport', undefined, res.errors);
+}
+
+/**
+ * Retrieve a file-based test with reporting.
+ */
+export async function getReport(options: GetReportOptions): Promise<Result<UploadReportResponseDto, ReportErrorCodes>> {
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, `/report/${options.pollId}`, options.orgId);
+  } catch (err) {
+    return generateError<ReportErrorCodes>(400, err.message, 'getReport');
+  }
+
+  const config: Payload = {
+    headers: {
+      ...commonHttpHeaders(options),
+    },
+    url,
+    method: 'get',
+  };
+
+  const res = await makeRequest<UploadReportResponseDto>(config);
+  if (res.success) return { type: 'success', value: res.body };
+  return generateError<ReportErrorCodes>(
+    res.errorCode,
+    REPORT_ERROR_MESSAGES,
+    'getReport',
+    res.error?.message,
+    res.errors,
+  );
+}
+
+/**
+ * Trigger an SCM-based test with reporting.
+ */
+export async function initScmReport(options: ScmUploadReportOptions): Promise<Result<string, ReportErrorCodes>> {
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, `/test`, options.orgId);
+  } catch (err) {
+    return generateError<ReportErrorCodes>(400, err.message, 'initReport');
+  }
+  const config: Payload = {
+    headers: {
+      ...commonHttpHeaders(options),
+    },
+    url,
+    method: 'post',
+    body: {
+      workflowData: {
+        projectId: options.projectId,
+        commitHash: options.commitId,
+      },
+      ...pick(options, ['severity', 'prioritized', 'analysisContext']),
+    },
+  };
+
+  const res = await makeRequest<InitScmUploadResponseDto>(config);
+  if (res.success) return { type: 'success', value: res.body.testId };
+  return generateError<ReportErrorCodes>(res.errorCode, REPORT_ERROR_MESSAGES, 'initReport', undefined, res.errors);
+}
+
+/**
+ * Fetch an SCM-based test with reporting.
+ */
+export async function getScmReport(
+  options: GetReportOptions,
+): Promise<Result<UploadReportResponseDto, ReportErrorCodes>> {
+  let url: string;
+
+  try {
+    url = getURL(options.baseURL, `/test/${options.pollId}`, options.orgId);
+  } catch (err) {
+    return generateError<ReportErrorCodes>(400, err.message, 'getReport');
+  }
+
+  const config: Payload = {
+    headers: {
+      ...commonHttpHeaders(options),
+    },
+    url,
+    method: 'get',
+  };
+
+  const res = await makeRequest<UploadReportResponseDto>(config);
+  if (res.success) return { type: 'success', value: res.body };
+  return generateError<ReportErrorCodes>(
+    res.errorCode,
+    REPORT_ERROR_MESSAGES,
+    'getReport',
+    res.error?.message,
+    res.errors,
+  );
 }

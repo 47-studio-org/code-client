@@ -1,69 +1,79 @@
 import * as fs from 'fs';
 import * as nodePath from 'path';
+import 'jest-extended';
 
 import {
-  collectIgnoreRules,
   collectBundleFiles,
   prepareExtendingBundle,
   composeFilePayloads,
-  parseFileIgnores,
   getFileInfo,
   getBundleFilePath,
   resolveBundleFilePath,
+  collectFilePolicies,
 } from '../src/files';
-
-import { sampleProjectPath, supportedFiles, bundleFiles, bundleFilesFull, bundleFileIgnores } from './constants/sample';
+import { getGlobPatterns } from '../src';
+import { FileInfo } from '../src/interfaces/files.interface';
+import {
+  sampleProjectPath,
+  supportedFiles,
+  bundleFiles,
+  bundleFilesFull,
+  bundleFileIgnores,
+  fileIgnoresFixtures,
+  bundleFilePolicies,
+} from './constants/sample';
 
 describe('files', () => {
-  it('parse dc ignore file', () => {
-    const patterns = parseFileIgnores(`${sampleProjectPath}/.dcignore`);
-    expect(patterns).toEqual(bundleFileIgnores.slice(1, 10));
-  });
-  it('parse dot snyk file', () => {
-    const patterns = parseFileIgnores(`${sampleProjectPath}/.snyk`);
-    expect(patterns).toEqual(bundleFileIgnores.slice(10));
-  });
-  it('parse dot snyk file with only one field', () => {
-    const patterns = parseFileIgnores(`${sampleProjectPath}/exclude/.snyk`);
-    expect(patterns).toEqual(bundleFileIgnores.slice(12));
-  });
-
-  it('collect ignore rules', async () => {
-    const ignoreRules = await collectIgnoreRules([sampleProjectPath]);
-    expect(ignoreRules).toEqual(bundleFileIgnores);
-  });
-
   it('collect bundle files', async () => {
     // TODO: We should introduce some performance test using a big enough repo to avoid flaky results
     const collector = collectBundleFiles({
       baseDir: sampleProjectPath,
       paths: [sampleProjectPath],
       supportedFiles,
-      fileIgnores: bundleFileIgnores,
+      filePolicies: bundleFilePolicies,
     });
-    const files = [];
-    const skippedOversizedFiles = [];
+    const files: FileInfo[] = [];
+    const skippedOversizedFiles: string[] = [];
     for await (const f of collector) {
       typeof f == 'string' ? skippedOversizedFiles.push(f) : files.push(f);
     }
     // all files in the repo are expected other than the file that exceeds MAX_FILE_SIZE 'big-file.js'
-    expect(files).toEqual((await bundleFiles).filter(obj => !obj.bundlePath.includes('big-file.js')));
+    const expectedFiles = (await bundleFiles).filter(obj => !obj.bundlePath.includes('big-file.js'));
+    expect(files.map(f => f.filePath)).toIncludeSameMembers(expectedFiles.map(f => f.filePath)); // Assert same files in bundle
+    expect(files).toIncludeSameMembers(expectedFiles); // Assert same properties for files in bundle
 
     // big-file.js should be added to skippedOversizedFiles
     expect(skippedOversizedFiles.length).toEqual(1);
     expect(skippedOversizedFiles[0]).toEqual('big-file.js');
 
-    const testFile = files[1];
-    expect(testFile.bundlePath).toEqual('AnnotatorTest.cpp');
-    expect(testFile.hash).toEqual('61b028b49c2a4513b1c7c161b5f491264fe71c9c29bc0ae8e6d760c156b45edc');
-    expect(testFile.filePath).toEqual(`${sampleProjectPath}/AnnotatorTest.cpp`);
-    expect(testFile.bundlePath).toEqual(`AnnotatorTest.cpp`);
-    expect(testFile.size).toEqual(239);
+    const filesWithoutBasePath = files.map(f => ({
+      ...f,
+      filePath: f.filePath.replace(sampleProjectPath, '<basePath>'),
+    }));
+    expect(filesWithoutBasePath).toMatchSnapshot();
+  });
+
+  it('collects only non-excluded files', async () => {
+    const testPath = `${fileIgnoresFixtures}/negative-overrides`;
+    const filePolicies = await collectFilePolicies([testPath]);
+    const collector = collectBundleFiles({
+      baseDir: testPath,
+      paths: [testPath],
+      supportedFiles,
+      filePolicies,
+    });
+    const files: FileInfo[] = [];
+    for await (const f of collector) {
+      typeof f !== 'string' && files.push(f);
+    }
+
+    expect(files).toHaveLength(1);
+    expect(files[0].bundlePath).toBe('.snyk');
   });
 
   it('extend bundle files', async () => {
     const testNewFiles = [`app.js`, `not/ignored/this_should_not_be_ignored.java`];
-    const testRemovedFiles = [`removed_from_the_parent_bundle.java`, `ignored/this_should_be_ignored.java`];
+    const testRemovedFiles = [`removed_from_the_parent_bundle.java`];
     const newBundle = [...testNewFiles, ...testRemovedFiles];
     const { files, removedFiles } = await prepareExtendingBundle(
       sampleProjectPath,
@@ -82,10 +92,13 @@ describe('files', () => {
       baseDir: sampleProjectPath,
       paths: folders,
       supportedFiles,
-      fileIgnores: [],
+      filePolicies: {
+        excludes: [],
+        ignores: [],
+      },
     });
-    const smallFiles = [];
-    const skippedOversizedFiles = [];
+    const smallFiles: FileInfo[] = [];
+    const skippedOversizedFiles: string[] = [];
     for await (const f of collector) {
       typeof f == 'string' ? skippedOversizedFiles.push(f) : smallFiles.push(f);
     }
@@ -100,10 +113,10 @@ describe('files', () => {
   it('compose file payloads', async () => {
     // Prepare all missing files first
     const payloads = [...composeFilePayloads(await bundleFilesFull, 1024)];
-    expect(payloads.length).toEqual(3); // 3 chunks
-    expect(payloads[0].length).toEqual(2);
+    expect(payloads.length).toEqual(4); // 4 chunks
+    expect(payloads[0].length).toEqual(4); // 4 files in first chunk
 
-    const testPayload = payloads[0][1];
+    const testPayload = payloads[3][0];
     expect(testPayload.filePath).toEqual(`${sampleProjectPath}/routes/sharks.js`);
     expect(testPayload.bundlePath).toEqual(`routes/sharks.js`);
     expect(testPayload.size).toEqual(363);
@@ -146,5 +159,46 @@ describe('files', () => {
 
     const windowsPath = 'C:\\Users\\user\\Git\\goof%20test\\index.js';
     expect(resolveBundleFilePath(baseDir, windowsPath)).toEqual(decodeURI(windowsPath));
+  });
+
+  describe('getGlobPatterns', () => {
+    it('generates correct glob patterns for supported files', () => {
+      const globPatterns = getGlobPatterns(supportedFiles);
+      expect(globPatterns).toEqual([
+        '*.[jJ][sS]',
+        '*.[jJ][sS][xX]',
+        '*.[cC][pP][pP]',
+        '*.[jJ][aA][vV][aA]',
+        '.eslintrc.json',
+        '.snyk',
+      ]);
+    });
+
+    it("doesn't generate any pattern for an empty file extension", () => {
+      const supportedFiles = {
+        extensions: ['', '.cs'],
+        configFiles: [],
+      };
+      const globPatterns = getGlobPatterns(supportedFiles);
+      expect(globPatterns).toEqual(['', '*.[cC][sS]']);
+    });
+
+    it("doesn't generate any pattern for invalid file extension", () => {
+      const supportedFiles = {
+        extensions: ['js', '.cs'],
+        configFiles: [],
+      };
+      const globPatterns = getGlobPatterns(supportedFiles);
+      expect(globPatterns).toEqual(['', '*.[cC][sS]']);
+    });
+
+    it("doesn't generate case variant pattern for chars without case variant", () => {
+      const supportedFiles = {
+        extensions: ['.ps1', '.ps'],
+        configFiles: [],
+      };
+      const globPatterns = getGlobPatterns(supportedFiles);
+      expect(globPatterns).toEqual(['*.[pP][sS]1', '*.[pP][sS]']);
+    });
   });
 });

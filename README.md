@@ -1,6 +1,6 @@
 # code-client
 
-Typescript consumer of public API
+Typescript consumer of the Snyk Code public APi
 
 [![npm version](https://img.shields.io/npm/v/@snyk/code-client.svg?style=flat-square)](https://www.npmjs.org/package/@snyk/code-client)
 [![npm downloads](https://img.shields.io/npm/dm/@snyk/code-client.svg?style=flat-square)](http://npm-stat.com/charts.html?package=@snyk/code-client)
@@ -56,7 +56,7 @@ const isLoggedIn = sessionResponse.value; // boolean
 
 ```javascript
 /** Building bundle process started with provided data */
-codeClient.emitter.on('scanFilesProgress', (processed: number) = {
+codeClient.emitter.on('scanFilesProgress', (processed: number) => {
   console.log(`Indexed ${processed} files`);
 });
 
@@ -71,10 +71,9 @@ codeClient.emitter.on('sendError', error => {
 });
 
 /** Logs HTTP requests sent to the API **/
-codeClient.emitter.on('apiRequestLog', (message) => {
+codeClient.emitter.on('apiRequestLog', message => {
   console.log(message);
 });
-
 ```
 
 Complete list of events:
@@ -117,6 +116,25 @@ const results = await codeClient.analyzeFolders({
 });
 ```
 
+### Run analysis and report results to platform
+
+```javascript
+const results = await codeClient.analyzeFolders({
+  connection: { baseURL, sessionToken, source },
+  analysisOptions: {
+    severity: 1,
+  },
+  fileOptions: {
+    paths: ['/home/user/repo'],
+    symlinksEnabled: false,
+  },
+  reportOptions: {
+    enabled: true,
+    projectName: 'example-project',
+  },
+});
+```
+
 ### Creates a new bundle based on a previously uploaded one
 
 ```javascript
@@ -130,10 +148,57 @@ const results = await codeClient.extendAnalysis({
 
 ```
 
+### Run analysis on an existing SCM project and report results to platform
+
+```javascript
+const results = await codeClient.analyzeScmProject({
+  connection: { baseURL, sessionToken, source },
+  analysisOptions: {
+    severity: 1,
+  },
+  reportOptions: {
+    projectId: '<Snyk Project UUID>',
+    commitId: '<Commit SHA to scan>',
+  },
+});
+```
+
 ### Errors
 
 If there are any errors the result of every call will contain the following:
 
 ```javascript
 const { error, statusCode, statusText } = result;
+```
+
+## CLI
+
+There is a way to run separate calls using a CLI
+
+### Create bundle
+
+Help manifest: `time npm run cli -- help bundle:create`
+
+```
+Usage: CLI bundle:create [options]
+
+create a new bundle and return its ID with meta info
+
+Options:
+  --patterns [string...]     supported file patterns
+  --ignore [path...]         ignored path glob
+  --path [path...]           source code dir
+  --url <url>                service URL
+  --token <hash>             user token
+  --org <string>             organization
+  --source <string>          source identifier (default: "code-client")
+  -H, --headers [string...]  custom headers e.g. "X-Custom-Header: some value". Can have multiple values diveded by space
+  --debug                    enable debug mode
+  -h, --help                 display help for command
+```
+
+Example call:
+
+```bash
+npm run cli -- bundle:create --url="<service url>" --token="<snyk token>" --headers="<extra>" --patterns=".*" --path="<absolute path>"
 ```

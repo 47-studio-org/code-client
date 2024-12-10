@@ -1,16 +1,19 @@
 import path from 'path';
+import nock from 'nock';
 import jsonschema from 'jsonschema';
+import 'jest-extended';
 
-import { analyzeFolders, extendAnalysis } from '../src/analysis';
+import { analyzeFolders, extendAnalysis, analyzeBundle, analyzeScmProject } from '../src/analysis';
 import { uploadRemoteBundle } from '../src/bundles';
 import { baseURL, sessionToken, source, TEST_TIMEOUT } from './constants/base';
-import { sampleProjectPath, bundleFilesFull, bundleExtender } from './constants/sample';
+import { sampleProjectPath, bundleFilesFull, bundleExtender, getReportReturn } from './constants/sample';
 import { emitter } from '../src/emitter';
 import { AnalysisResponseProgress } from '../src/http';
 import { SupportedFiles } from '../src/interfaces/files.interface';
 import { AnalysisSeverity, AnalysisContext } from '../src/interfaces/analysis-options.interface';
 import * as sarifSchema from './sarif-schema-2.1.0.json';
 import * as needle from '../src/needle';
+import * as report from '../src/report';
 
 describe('Functional test of analysis', () => {
   describe('analyzeFolders', () => {
@@ -52,7 +55,7 @@ describe('Functional test of analysis', () => {
         emitter.on(emitter.events.apiRequestLog, onAPIRequestLog);
 
         const bundle = await analyzeFolders({
-          connection: { baseURL, sessionToken, source, base64Encoding: false },
+          connection: { baseURL, sessionToken, source },
           analysisOptions: {
             severity: 1,
             prioritized: true,
@@ -85,29 +88,30 @@ describe('Functional test of analysis', () => {
         expect(bundle.analysisResults.timing.analysis).toBeGreaterThanOrEqual(0);
         expect(bundle.analysisResults.timing.fetchingCode).toBeGreaterThanOrEqual(0);
         expect(bundle.analysisResults.timing.queue).toBeGreaterThanOrEqual(0);
-        expect(new Set(bundle.analysisResults.coverage)).toEqual(
-          new Set([
-            {
-              files: 2,
-              isSupported: true,
-              lang: 'Java',
-            },
-            {
-              files: 1,
-              isSupported: true,
-              lang: 'C++ (beta)',
-            },
-            {
-              files: 6,
-              isSupported: true,
-              lang: 'JavaScript',
-            },
-          ]),
-        );
+        expect(bundle.analysisResults.coverage).toIncludeSameMembers([
+          {
+            files: 2,
+            isSupported: true,
+            lang: 'Java',
+            type: 'SUPPORTED',
+          },
+          {
+            files: 1,
+            isSupported: true,
+            lang: 'C++',
+            type: 'SUPPORTED',
+          },
+          {
+            files: 6,
+            isSupported: true,
+            lang: 'JavaScript',
+            type: 'SUPPORTED',
+          },
+        ]);
 
         // Check if emitter event happened
         expect(onSupportedFilesLoaded).toHaveBeenCalledTimes(2);
-        expect(onScanFilesProgress).toHaveBeenCalledTimes(11);
+        expect(onScanFilesProgress).toHaveBeenCalledTimes(bFiles.length);
         expect(onCreateBundleProgress).toHaveBeenCalledTimes(2);
         expect(onAnalyseProgress).toHaveBeenCalled();
         expect(onAPIRequestLog).toHaveBeenCalled();
@@ -119,7 +123,6 @@ describe('Functional test of analysis', () => {
           source,
           bundleHash: bundle.fileBundle.bundleHash,
           files: [],
-          base64Encoding: false,
         });
 
         const onUploadBundleProgress = jest.fn((processed: number, total: number) => {
@@ -139,7 +142,6 @@ describe('Functional test of analysis', () => {
           source,
           bundleHash: bundle.fileBundle.bundleHash,
           files: bFiles.filter(({ bundlePath }) => !shouldNotBeInBundle.includes(bundlePath)),
-          base64Encoding: false,
         });
         expect(onUploadBundleProgress).toHaveBeenCalledTimes(2);
         expect(onAPIRequestLog).toHaveBeenCalled();
@@ -149,7 +151,7 @@ describe('Functional test of analysis', () => {
 
     it('analyze folder legacy json results', async () => {
       const bundle = await analyzeFolders({
-        connection: { baseURL, sessionToken, source, base64Encoding: false },
+        connection: { baseURL, sessionToken, source },
         analysisOptions: { severity: AnalysisSeverity.info, prioritized: true, legacy: true },
         fileOptions: {
           paths: [sampleProjectPath],
@@ -170,7 +172,7 @@ describe('Functional test of analysis', () => {
 
     it('analyze folder - with sarif returned', async () => {
       const bundle = await analyzeFolders({
-        connection: { baseURL, sessionToken, source, base64Encoding: false },
+        connection: { baseURL, sessionToken, source },
         analysisOptions: { severity: AnalysisSeverity.info, prioritized: true },
         fileOptions: {
           paths: [sampleProjectPath],
@@ -191,7 +193,7 @@ describe('Functional test of analysis', () => {
 
     it('analyze empty folder', async () => {
       const bundle = await analyzeFolders({
-        connection: { baseURL, sessionToken, source, base64Encoding: false },
+        connection: { baseURL, sessionToken, source },
         analysisOptions: { severity: AnalysisSeverity.info },
         fileOptions: {
           paths: [path.join(sampleProjectPath, 'only_text')],
@@ -207,7 +209,7 @@ describe('Functional test of analysis', () => {
       'extend folder analysis',
       async () => {
         const fileAnalysis = await analyzeFolders({
-          connection: { baseURL, sessionToken, source, base64Encoding: false },
+          connection: { baseURL, sessionToken, source },
           analysisOptions: {
             severity: 1,
           },
@@ -269,30 +271,32 @@ describe('Functional test of analysis', () => {
         expect(extendedBundle.analysisResults.timing.analysis).toBeGreaterThanOrEqual(0);
         expect(extendedBundle.analysisResults.timing.fetchingCode).toBeGreaterThanOrEqual(0);
         expect(extendedBundle.analysisResults.timing.queue).toBeGreaterThanOrEqual(0);
-        expect(new Set(extendedBundle.analysisResults.coverage)).toEqual(
-          new Set([
-            {
-              files: 2,
-              isSupported: true,
-              lang: 'Java',
-            },
-            {
-              files: 1,
-              isSupported: true,
-              lang: 'C++ (beta)',
-            },
-            {
-              files: 4,
-              isSupported: true,
-              lang: 'JavaScript',
-            },
-            {
-              files: 1,
-              isSupported: true,
-              lang: 'JSX',
-            },
-          ]),
-        );
+        expect(extendedBundle.analysisResults.coverage).toIncludeSameMembers([
+          {
+            files: 2,
+            isSupported: true,
+            lang: 'Java',
+            type: 'SUPPORTED',
+          },
+          {
+            files: 1,
+            isSupported: true,
+            lang: 'C++',
+            type: 'SUPPORTED',
+          },
+          {
+            files: 4,
+            isSupported: true,
+            lang: 'JavaScript',
+            type: 'SUPPORTED',
+          },
+          {
+            files: 1,
+            isSupported: true,
+            lang: 'JSX',
+            type: 'SUPPORTED',
+          },
+        ]);
       },
       TEST_TIMEOUT,
     );
@@ -302,32 +306,121 @@ describe('Functional test of analysis', () => {
         analysisContext: {
           flow: 'test',
           initiator: 'CLI',
-          orgDisplayName: 'org',
-          orgPublicId: 'id',
-          projectName: 'proj',
-          projectPublicId: 'id',
+          org: {
+            name: 'org',
+            displayName: 'organization',
+            publicId: 'id',
+            flags: {},
+          },
+          project: {
+            name: 'proj',
+            publicId: 'id',
+            type: 'code',
+          },
         },
       };
 
       const makeRequestSpy = jest.spyOn(needle, 'makeRequest');
 
-      await analyzeFolders({
-        connection: { baseURL, sessionToken, source, base64Encoding: false },
-        analysisOptions: {
+      try {
+        await analyzeBundle({
+          baseURL,
+          sessionToken,
+          source,
+          org: 'org',
           severity: 1,
-        },
-        fileOptions: {
-          paths: [sampleProjectPath],
-          symlinksEnabled: false,
-        },
-        ...analysisContext,
-      });
+          bundleHash: 'hash',
+          shard: sampleProjectPath,
+          ...analysisContext,
+        });
+      } catch (err) {
+        // Authentication mechanism should deny the request as this user does not belong to the org 'org'
+        expect(err).toEqual({
+          apiName: 'getAnalysis',
+          statusCode: 401,
+          statusText: 'Missing, revoked or inactive token',
+        });
+      }
+
       const makeRequestSpyLastCalledWith = makeRequestSpy.mock.calls[makeRequestSpy.mock.calls.length - 1][0];
       expect(makeRequestSpyLastCalledWith).toEqual(
         expect.objectContaining({
           body: expect.objectContaining(analysisContext),
+          headers: expect.objectContaining({
+            'snyk-org-name': 'org',
+            source: 'test-source',
+          }),
         }),
       );
+    });
+
+    it('should successfully analyze folder and report results with the report option enabled', async () => {
+      nock(baseURL, { allowUnmocked: true })
+        .post('/report')
+        .reply(200, { reportId: 'report-id' })
+        .get('/report/report-id')
+        .reply(200, getReportReturn);
+
+      const result = await analyzeFolders({
+        connection: { baseURL, sessionToken, source },
+        analysisOptions: { severity: AnalysisSeverity.info },
+        fileOptions: {
+          paths: [sampleProjectPath],
+          symlinksEnabled: false,
+        },
+        reportOptions: {
+          enabled: true,
+          projectName: 'test-project',
+        },
+      });
+
+      nock.cleanAll();
+
+      expect(result).not.toBeNull();
+      expect(result).toHaveProperty('fileBundle');
+      expect(result).toHaveProperty('analysisResults');
+      expect(result).toHaveProperty('reportResults');
+    });
+
+    it('should successfully analyze folder but not report with the report option disabled', async () => {
+      const mockReportBundle = jest.spyOn(report, 'reportBundle');
+
+      const bundle = await analyzeFolders({
+        connection: { baseURL, sessionToken, source },
+        analysisOptions: { severity: AnalysisSeverity.info },
+        fileOptions: {
+          paths: [sampleProjectPath],
+          symlinksEnabled: false,
+        },
+      });
+
+      expect(mockReportBundle).not.toHaveBeenCalled();
+      expect(bundle).toBeTruthy();
+    });
+  });
+
+  describe('analyzeScmProject', () => {
+    it('should successfully analyze SCM project and report results', async () => {
+      nock(baseURL, { allowUnmocked: true })
+        .post('/test')
+        .reply(200, { testId: 'test-id' })
+        .get('/test/test-id')
+        .reply(200, getReportReturn);
+
+      const result = await analyzeScmProject({
+        connection: { baseURL, sessionToken, source },
+        analysisOptions: { severity: AnalysisSeverity.info },
+        reportOptions: {
+          projectId: '00000000-0000-0000-0000-000000000000',
+          commitId: '0000000',
+        },
+      });
+
+      nock.cleanAll();
+
+      expect(result).not.toBeNull();
+      expect(result).toHaveProperty('analysisResults');
+      expect(result).toHaveProperty('reportResults');
     });
   });
 });

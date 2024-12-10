@@ -12,8 +12,10 @@ import {
   GetAnalysisResponseDto,
   AnalysisFailedResponse,
   GetAnalysisOptions,
+  ConnectionOptions,
 } from './http';
 import { createBundleFromFolders, remoteBundleFactory } from './bundles';
+import { reportBundle, reportScm } from './report';
 import { emitter } from './emitter';
 import {
   AnalysisResult,
@@ -21,11 +23,27 @@ import {
   AnalysisResultSarif,
   AnalysisFiles,
   Suggestion,
+  ReportUploadResult,
+  ScmAnalysis,
 } from './interfaces/analysis-result.interface';
-import { FileAnalysisOptions } from './interfaces/analysis-options.interface';
+import { AnalysisContext, FileAnalysisOptions, ScmAnalysisOptions } from './interfaces/analysis-options.interface';
 import { FileAnalysis } from './interfaces/files.interface';
 
 const sleep = (duration: number) => new Promise(resolve => setTimeout(resolve, duration));
+
+function getConnectionOptions(connectionOptions: ConnectionOptions): ConnectionOptions {
+  return {
+    ...connectionOptions,
+    // Ensure requestId is set.
+    requestId: connectionOptions.requestId ?? uuidv4(),
+  };
+}
+
+function getAnalysisContext(
+  analysisContext: AnalysisContext['analysisContext'] | undefined,
+): AnalysisContext | Record<string, never> {
+  return analysisContext ? { analysisContext } : {};
+}
 
 async function pollAnalysis(
   options: GetAnalysisOptions,
@@ -90,33 +108,53 @@ function normalizeResultFiles(files: AnalysisFiles, baseDir: string): AnalysisFi
   }, {});
 }
 
+/**
+ * Perform a file-based analysis.
+ * Optionally with reporting of results to the platform.
+ */
 export async function analyzeFolders(options: FileAnalysisOptions): Promise<FileAnalysis | null> {
-  if (!options.connection.requestId) {
-    options.connection.requestId = uuidv4();
-  }
+  const connectionOptions = getConnectionOptions(options.connection);
+  const analysisContext = getAnalysisContext(options.analysisContext);
+
   const fileBundle = await createBundleFromFolders({
-    ...options.connection,
+    ...connectionOptions,
     ...options.fileOptions,
     languages: options.languages,
-    ...(options.analysisContext ? { analysisContext: options.analysisContext } : {}),
   });
   if (fileBundle === null) return null;
 
-  // Analyze bundle
-  const analysisResults = await analyzeBundle({
+  const config = {
     bundleHash: fileBundle.bundleHash,
-    ...options.connection,
+    ...connectionOptions,
     ...options.analysisOptions,
     shard: calcHash(fileBundle.baseDir),
-    ...(options.analysisContext ? { analysisContext: options.analysisContext } : {}),
-  });
+    ...analysisContext,
+  };
+
+  let analysisResults: AnalysisResult;
+
+  // Whether this is a report/result upload operation.
+  const isReport = options.reportOptions?.enabled ?? false;
+  let reportResults: ReportUploadResult | undefined;
+  if (isReport && options.reportOptions) {
+    // Analyze and upload bundle results.
+    const reportRes = await reportBundle({
+      ...config,
+      report: options.reportOptions,
+    });
+    analysisResults = reportRes.analysisResult;
+    reportResults = reportRes.uploadResult;
+  } else {
+    // Analyze bundle.
+    analysisResults = await analyzeBundle(config);
+  }
 
   if (analysisResults.type === 'legacy') {
     // expand relative file names to absolute ones only for legacy results
     analysisResults.files = normalizeResultFiles(analysisResults.files, fileBundle.baseDir);
   }
 
-  return { fileBundle, analysisResults, ...options };
+  return { fileBundle, analysisResults, reportResults, ...options };
 }
 
 function mergeBundleResults(
@@ -311,4 +349,22 @@ export async function extendAnalysis(options: FileAnalysis & { files: string[] }
   );
 
   return { ...options, fileBundle, analysisResults };
+}
+
+/**
+ * Perform an SCM-based analysis for an existing project,
+ * with reporting of results to the platform.
+ */
+export async function analyzeScmProject(options: ScmAnalysisOptions): Promise<ScmAnalysis | null> {
+  const connectionOptions = getConnectionOptions(options.connection);
+  const analysisContext = getAnalysisContext(options.analysisContext);
+
+  const { analysisResult: analysisResults, uploadResult: reportResults } = await reportScm({
+    ...connectionOptions,
+    ...options.analysisOptions,
+    ...options.reportOptions,
+    ...analysisContext,
+  });
+
+  return { analysisResults, reportResults };
 }

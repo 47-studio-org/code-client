@@ -16,8 +16,9 @@ import {
   IGNORE_FILES_NAMES,
   CACHE_KEY,
   DOTSNYK_FILENAME,
+  EXCLUDED_NAMES,
 } from './constants';
-import { CollectBundleFilesOptions } from './interfaces/analysis-options.interface';
+import { CollectBundleFilesOptions, FilePolicies } from './interfaces/analysis-options.interface';
 import { SupportedFiles, FileInfo } from './interfaces/files.interface';
 
 const isWindows = nodePath.sep === '\\';
@@ -128,28 +129,77 @@ export function parseFileIgnores(path: string): string[] {
       );
     }
   }
-  return parseIgnoreRulesToGlobs(rules, dirname);
+  try {
+    return parseIgnoreRulesToGlobs(rules, dirname);
+  } catch (err) {
+    console.error('Could not parse ignore rules to glob', { path });
+    throw new Error('Please make sure ignore file follows correct syntax');
+  }
 }
 
 export function getGlobPatterns(supportedFiles: SupportedFiles): string[] {
   return [
-    ...supportedFiles.extensions.map(e => `*${e}`),
-    ...supportedFiles.configFiles.filter(e => !IGNORE_FILES_NAMES.includes(e)),
+    ...supportedFiles.extensions.map(e => `${generateAllCaseGlobPattern(e)}`),
+    ...supportedFiles.configFiles.filter(e => !EXCLUDED_NAMES.includes(e)),
   ];
 }
 
-export async function collectIgnoreRules(
+// Generates glob patterns for case-insensitive file extension matching.
+// E.g. *.[jJ][sS] for matching .js files without case-sensitivity.
+function generateAllCaseGlobPattern(fileExtension: string): string {
+  const chars = Array.from(fileExtension);
+  if (!chars.length) {
+    console.log('Invalid file extension pattern: file extension is empty.');
+    return '';
+  }
+
+  if (chars[0] != '.') {
+    console.log(
+      "Invalid file extension pattern: missing '.' in the beginning of the file extension. Some files may not be included in the analysis.",
+    );
+    return '';
+  }
+
+  const caseInsensitivePatterns = chars.reduce((pattern: string[], extensionChar, i) => {
+    if (i == 0) {
+      // first char should always be '.', no need to generate multiple cases for file extension character
+      return ['*.'];
+    }
+
+    if (extensionChar.toLowerCase() == extensionChar.toUpperCase()) {
+      // Char doesn't have case variant, return as-is.
+      return pattern.concat(extensionChar);
+    }
+
+    const globCharPattern = `[${extensionChar.toLowerCase()}${extensionChar.toUpperCase()}]`;
+    return pattern.concat(globCharPattern);
+  }, []);
+  return caseInsensitivePatterns.join('');
+}
+
+/**
+ * Recursively collect all exclude and ignore rules from "dirs".
+ *
+ * Exclude rules from .snyk files and ignore rules from .[*]ignore files are collected separately.
+ * Any .[*]ignore files in paths excluded by .snyk exclude rules are ignored.
+ */
+export async function collectFilePolicies(
   dirs: string[],
   symlinksEnabled = false,
   fileIgnores: string[] = IGNORES_DEFAULT,
-): Promise<string[]> {
+): Promise<FilePolicies> {
   const tasks = dirs.map(async folder => {
     const fileStats = await lStat(folder);
     // Check if symlink and exclude if requested
-    if (!fileStats || (fileStats.isSymbolicLink() && !symlinksEnabled) || fileStats.isFile()) return [];
+    if (!fileStats || (fileStats.isSymbolicLink() && !symlinksEnabled) || fileStats.isFile()) {
+      return {
+        excludes: [],
+        ignores: [],
+      };
+    }
 
-    // Find ignore files inside this directory
-    const localIgnoreFiles = await fg(
+    // Find .snyk and .[*]ignore files inside this directory.
+    const allIgnoredFiles = await fg(
       IGNORE_FILES_NAMES.map(i => `*${i}`),
       {
         ...fgOptions,
@@ -157,11 +207,31 @@ export async function collectIgnoreRules(
         followSymbolicLinks: symlinksEnabled,
       },
     );
-    // Read ignore files and merge new patterns
-    return union(...localIgnoreFiles.map(parseFileIgnores));
+
+    // Parse rules from all .snyk files inside this directory.
+    const snykFiles = allIgnoredFiles.filter(f => f.endsWith(DOTSNYK_FILENAME));
+    const snykExcludeRules = union(...snykFiles.map(parseFileIgnores));
+
+    // Parse rules from relevant .[*]ignore files inside this directory.
+    // Exclude ignore files under paths excluded by .snyk files.
+    const ignoreFiles = allIgnoredFiles.filter(
+      f => !f.endsWith(DOTSNYK_FILENAME) && multimatch([nodePath.dirname(f)], snykExcludeRules).length === 0,
+    );
+    const ignoreFileRules = union(...ignoreFiles.map(parseFileIgnores));
+
+    return {
+      excludes: snykExcludeRules,
+      ignores: ignoreFileRules,
+    };
   });
-  const customRules = await Promise.all(tasks);
-  return union(fileIgnores, ...customRules);
+
+  const collectedRules = await Promise.all(tasks);
+
+  return {
+    excludes: union(...collectedRules.map(policies => policies.excludes)),
+    // Merge external and collected ignore rules
+    ignores: union(fileIgnores, ...collectedRules.map(policies => policies.ignores)),
+  };
 }
 
 export function determineBaseDir(paths: string[]): string {
@@ -181,10 +251,10 @@ async function* searchFiles(
   patterns: string[],
   cwd: string,
   symlinksEnabled: boolean,
-  ignores: string[],
+  policies: FilePolicies,
 ): AsyncGenerator<string | Buffer> {
-  const positiveIgnores = ignores.filter(rule => !rule.startsWith('!'));
-  const negativeIgnores = ignores.filter(rule => rule.startsWith('!')).map(rule => rule.substring(1));
+  const positiveIgnores = [...policies.excludes, ...policies.ignores.filter(rule => !rule.startsWith('!'))];
+  const negativeIgnores = policies.ignores.filter(rule => rule.startsWith('!')).map(rule => rule.substring(1));
   // We need to use the ignore rules directly in the stream. Otherwise we would expand all the branches of the file system
   // that should be ignored, leading to performance issues (the parser would look stuck while analyzing each ignored file).
   // However, fast-glob doesn't address the negative rules in the ignore option correctly.
@@ -201,6 +271,8 @@ async function* searchFiles(
   for await (const filePath of positiveSearcher) {
     yield filePath;
   }
+
+  const deepPatterns = patterns.map(p => `**/${p}`);
   // TODO: This is incorrect because the .gitignore format allows to specify exceptions to previous rules, therefore
   // the separation between positive and negative ignores is incorrect in a scenario with 2+ exeptions like the one below:
   // `node_module/` <= ignores everything in a `node_module` folder and it's relative subfolders
@@ -212,15 +284,11 @@ async function* searchFiles(
       cwd,
       followSymbolicLinks: symlinksEnabled,
       baseNameMatch: false,
+      // Exclude rules should still be respected
+      ignore: policies.excludes,
     });
     for await (const filePath of negativeSearcher) {
-      if (
-        isMatch(
-          filePath.toString(),
-          patterns.map(p => `**/${p}`),
-        )
-      )
-        yield filePath;
+      if (isMatch(filePath.toString(), deepPatterns)) yield filePath;
     }
   }
 }
@@ -232,7 +300,7 @@ async function* searchFiles(
 export async function* collectBundleFiles({
   symlinksEnabled = false,
   baseDir,
-  fileIgnores,
+  filePolicies,
   paths,
   supportedFiles,
 }: CollectBundleFilesOptions): AsyncGenerator<FileInfo | string> {
@@ -258,7 +326,7 @@ export async function* collectBundleFiles({
   // Scan folders
   const globPatterns = getGlobPatterns(supportedFiles);
   for (const folder of dirs) {
-    const searcher = searchFiles(globPatterns, folder, symlinksEnabled, fileIgnores);
+    const searcher = searchFiles(globPatterns, folder, symlinksEnabled, filePolicies);
     // eslint-disable-next-line no-await-in-loop
     for await (const filePath of searcher) {
       const fileInfo = await getFileInfo(filePath.toString(), baseDir, false, cache);
@@ -271,7 +339,7 @@ export async function* collectBundleFiles({
 
   // Sanitize files
   if (files.length) {
-    const searcher = searchFiles(filterSupportedFiles(files, supportedFiles), baseDir, symlinksEnabled, fileIgnores);
+    const searcher = searchFiles(filterSupportedFiles(files, supportedFiles), baseDir, symlinksEnabled, filePolicies);
     for await (const filePath of searcher) {
       const fileInfo = await getFileInfo(filePath.toString(), baseDir, false, cache);
       // dc ignore AttrAccessOnNull: false positive, there is a precondition with &&
@@ -430,7 +498,8 @@ export function resolveBundleFilePath(baseDir: string, bundleFilePath: string): 
   return decodeURI(relPath);
 }
 
-export function* composeFilePayloads(files: FileInfo[], bucketSize = MAX_PAYLOAD): Generator<FileInfo[]> {
+// MAX_PAYLOAD / 2 is because every char takes 2 bytes in the payload
+export function* composeFilePayloads(files: FileInfo[], bucketSize = MAX_PAYLOAD / 2): Generator<FileInfo[]> {
   type Bucket = {
     size: number;
     files: FileInfo[];
@@ -439,7 +508,10 @@ export function* composeFilePayloads(files: FileInfo[], bucketSize = MAX_PAYLOAD
 
   let bucketIndex = -1;
   const getFileDataPayloadSize = (fileData: FileInfo) =>
-    (fileData.content?.length || 0) + fileData.bundlePath.length + fileData.hash.length;
+    (fileData.content?.length ? fileData.content.length + 16 : 0) +
+    fileData.bundlePath.length +
+    fileData.hash.length +
+    6; // constants is for the separators
   const isLowerSize = (size: number, fileData: FileInfo) => size >= getFileDataPayloadSize(fileData);
   for (const fileData of files) {
     // This file is empty or too large to send, it should be skipped.
